@@ -1,0 +1,49 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+layout (std430, set = 0, binding = 0) readonly buffer SortedList {
+    uint keys_high[]; 
+};
+
+layout (std430, set = 0, binding = 1) writeonly buffer Out {
+    uint boundaries[];
+};
+
+layout( push_constant ) uniform Constants
+{
+    uint numInstances;
+    uint numTiles;
+};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= numInstances) {
+        return;
+    }
+
+    uint key = keys_high[index];
+    bool keyValid = key < numTiles;
+
+    if (index == 0) {
+        if (keyValid) {
+            boundaries[key * 2] = index;
+        }
+    } else {
+        uint prevKey = keys_high[index - 1];
+        bool prevValid = prevKey < numTiles;
+        if ((key != prevKey) || (!keyValid) || (!prevValid)) {
+            if (keyValid) {
+                boundaries[key * 2] = index;
+            }
+            if (prevValid) {
+                boundaries[prevKey * 2 + 1] = index;
+            }
+        }
+    }
+    if (index == numInstances - 1 && keyValid) {
+        boundaries[key * 2 + 1] = numInstances;
+    }
+}

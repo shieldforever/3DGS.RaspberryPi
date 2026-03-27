@@ -1,0 +1,53 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+layout (std430, set = 0, binding = 0) readonly buffer Vertices {
+    Vertex vertices[];
+};
+
+layout (std140, set = 1, binding = 0) uniform Params {
+    vec4 camera_position;
+    mat4 proj_mat;
+    mat4 view_mat;
+    uint width;
+    uint height;
+    float tan_fovx;
+    float tan_fovy;
+};
+
+layout (std430, set = 1, binding = 1) writeonly buffer GaussianMask {
+    uint mask[];
+};
+
+layout( push_constant ) uniform MogSelectConstants {
+    uint enable_mog_select;
+};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= vertices.length()) {
+        return;
+    }
+
+    if (enable_mog_select == 0u) {
+        mask[index] = 1u;
+        return;
+    }
+
+    vec3 dir = camera_position.xyz - vertices[index].position.xyz;
+    float dirNorm = length(dir) + 1e-8;
+    dir /= dirNorm;
+
+    vec3 abc = vertices[index].abc_d.xyz;
+    float abcNorm = length(abc) + 1e-8;
+    abc /= abcNorm;
+
+    float cos_sim = dot(abc, dir);
+    cos_sim = (cos_sim + 1.0) * 0.5;
+    float d = vertices[index].abc_d.w;
+
+    mask[index] = (cos_sim > d) ? 1u : 0u;
+}

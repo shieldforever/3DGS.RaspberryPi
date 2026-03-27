@@ -1,0 +1,328 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+
+layout (std430, set = 0, binding = 0) readonly buffer Vertices {
+    Vertex vertices[];
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Cov3Ds {
+    float cov3ds[];
+};
+
+layout (std140, set = 1, binding = 0) uniform Params {
+    vec4 camera_position;
+    mat4 proj_mat;
+    mat4 view_mat;
+    uint width;
+    uint height;
+    float tan_fovx;
+    float tan_fovy;
+};
+
+layout (std430, set = 1, binding = 1) readonly buffer GaussianMask {
+    uint mask[];
+};
+
+layout (std430, set = 1, binding = 2) writeonly buffer VertexAttributes {
+    VertexAttribute attr[];
+};
+
+layout (std430, set = 1, binding = 3) writeonly buffer NumTilesOverlap {
+    uint tiles_overlap[];
+};
+
+layout( push_constant ) uniform PreprocessConstants {
+    uint use_origin_intersection;
+};
+
+layout (local_size_x = TILE_WIDTH * TILE_HEIGHT, local_size_y = 1, local_size_z = 1) in;
+
+mat3 get_projection_jacobian_approx(vec3 t) {
+    float limx = 1.3 * tan_fovx;
+    float limy = 1.3 * tan_fovy;
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    t.x = min(limx, max(-limx, txtz)) * t.z;
+    t.y = min(limy, max(-limy, tytz)) * t.z;
+
+    float focal_x = width / (2 * tan_fovx);
+    float focal_y = height / (2 * tan_fovy);
+
+    return mat3(
+        focal_x / t.z, 0, -(focal_x * t.x) / (t.z * t.z),
+        0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+        0, 0, 0
+    );
+}
+
+mat2 compute_cov2d(vec3 cam) {
+    uint index = gl_GlobalInvocationID.x;
+    mat3 J = get_projection_jacobian_approx(cam);
+    mat3 W = transpose(mat3(view_mat));
+    mat3 Sigma = mat3(
+        cov3ds[index * 6], cov3ds[index * 6 + 1], cov3ds[index * 6 + 2],
+        cov3ds[index * 6 + 1], cov3ds[index * 6 + 3], cov3ds[index * 6 + 4],
+        cov3ds[index * 6 + 2], cov3ds[index * 6 + 4], cov3ds[index * 6 + 5]
+    );
+    mat3 T = W * J;
+    mat3 cov2d = transpose(T) * Sigma * T;
+    cov2d[0][0] += 0.3f;
+    cov2d[1][1] += 0.3f;
+    return mat2(cov2d);
+}
+
+vec3 get_sh_vec3(uint ind) {
+    uint index = gl_GlobalInvocationID.x;
+    return vec3(vertices[index].sh[ind * 3], vertices[index].sh[ind * 3 + 1], vertices[index].sh[ind * 3 + 2]);
+}
+
+vec3 compute_sh() {
+    uint index = gl_GlobalInvocationID.x;
+
+    vec3 ray_direction = vertices[index].position.xyz - camera_position.xyz;
+    ray_direction /= length(ray_direction);
+    float x = ray_direction.x, y = ray_direction.y, z = ray_direction.z;
+
+    vec3 c = SH_C0 * get_sh_vec3(0);
+
+    c -= SH_C1 * get_sh_vec3(1) * y;
+    c += SH_C1 * get_sh_vec3(2) * z;
+    c -= SH_C1 * get_sh_vec3(3) * x;
+
+    c += SH_C2[0] * get_sh_vec3(4) * x * y;
+    c += SH_C2[1] * get_sh_vec3(5) * y * z;
+    c += SH_C2[2] * get_sh_vec3(6) * (2.0 * z * z - x * x - y * y);
+    c += SH_C2[3] * get_sh_vec3(7) * z * x;
+    c += SH_C2[4] * get_sh_vec3(8) * (x * x - y * y);
+
+    c += SH_C3[0] * get_sh_vec3(9) * (3.0 * x * x - y * y) * y;
+    c += SH_C3[1] * get_sh_vec3(10) * x * y * z;
+    c += SH_C3[2] * get_sh_vec3(11) * (4.0 * z * z - x * x - y * y) * y;
+    c += SH_C3[3] * get_sh_vec3(12) * z * (2.0 * z * z - 3.0 * x * x - 3.0 * y * y);
+    c += SH_C3[4] * get_sh_vec3(13) * x * (4.0 * z * z - x * x - y * y);
+    c += SH_C3[5] * get_sh_vec3(14) * (x * x - y * y) * z;
+    c += SH_C3[6] * get_sh_vec3(15) * x * (x * x - 3.0 * y * y);
+
+    c += 0.5;
+
+    if (c.x < 0.0) {
+        c.x = 0.0;
+    }
+
+//    assert(all(lessThanEqual(c, vec3(159.0))), "invalid sh: %f %f %f\n", c);
+    return c;
+}
+
+float ndc2Pix(float v, int S)
+{
+    return ((v + 1.0) * S - 1.0) * 0.5;
+}
+
+uint duplicate_to_tiles_touched_origin(vec2 uv, float radii, ivec2 tile_shape, out uvec4 bounding_box) {
+    bounding_box = uvec4(
+        uint(clamp(int((uv.x - radii) / TILE_WIDTH), 0, tile_shape.x)),
+        uint(clamp(int((uv.y - radii) / TILE_HEIGHT), 0, tile_shape.y)),
+        uint(clamp(int((uv.x + radii + TILE_WIDTH - 1) / TILE_WIDTH), 0, tile_shape.x)),
+        uint(clamp(int((uv.y + radii + TILE_HEIGHT - 1) / TILE_HEIGHT), 0, tile_shape.y))
+    );
+    return (bounding_box.z - bounding_box.x) * (bounding_box.w - bounding_box.y);
+}
+
+vec2 compute_ellipse_intersection(vec4 con_o, float disc, float t, vec2 p, bool is_y, float coord) {
+    float p_u = is_y ? p.y : p.x;
+    float p_v = is_y ? p.x : p.y;
+    float coeff = is_y ? con_o.x : con_o.z;
+
+    float h = coord - p_u;
+    float sqrt_term = sqrt(disc * h * h + t * coeff);
+
+    return vec2(
+        (-con_o.y * h - sqrt_term) / coeff + p_v,
+        (-con_o.y * h + sqrt_term) / coeff + p_v
+    );
+}
+
+uint process_tiles_count(
+    vec4 con_o,
+    float disc,
+    float t,
+    vec2 p,
+    vec2 bbox_min,
+    vec2 bbox_max,
+    vec2 bbox_argmin,
+    vec2 bbox_argmax,
+    ivec2 rect_min,
+    ivec2 rect_max,
+    bool is_y
+) {
+    float block_u = is_y ? float(TILE_HEIGHT) : float(TILE_WIDTH);
+    float block_v = is_y ? float(TILE_WIDTH) : float(TILE_HEIGHT);
+
+    if (is_y) {
+        rect_min = rect_min.yx;
+        rect_max = rect_max.yx;
+        bbox_min = bbox_min.yx;
+        bbox_max = bbox_max.yx;
+        bbox_argmin = bbox_argmin.yx;
+        bbox_argmax = bbox_argmax.yx;
+    }
+
+    uint tiles_count = 0;
+    vec2 intersect_min_line;
+    vec2 intersect_max_line = vec2(bbox_max.y, bbox_min.y);
+    float ellipse_min;
+    float ellipse_max;
+
+    float min_line = float(rect_min.x) * block_u;
+    if (bbox_min.x <= min_line) {
+        intersect_min_line = compute_ellipse_intersection(con_o, disc, t, p, is_y, min_line);
+    } else {
+        intersect_min_line = intersect_max_line;
+    }
+
+    for (int u = rect_min.x; u < rect_max.x; ++u) {
+        float max_line = min_line + block_u;
+        if (max_line <= bbox_max.x) {
+            intersect_max_line = compute_ellipse_intersection(con_o, disc, t, p, is_y, max_line);
+        }
+
+        if (min_line <= bbox_argmin.y && bbox_argmin.y < max_line) {
+            ellipse_min = bbox_min.y;
+        } else {
+            ellipse_min = min(intersect_min_line.x, intersect_max_line.x);
+        }
+
+        if (min_line <= bbox_argmax.y && bbox_argmax.y < max_line) {
+            ellipse_max = bbox_max.y;
+        } else {
+            ellipse_max = max(intersect_min_line.y, intersect_max_line.y);
+        }
+
+        int min_tile_v = max(rect_min.y, min(rect_max.y, int(ellipse_min / block_v)));
+        int max_tile_v = min(rect_max.y, max(rect_min.y, int(ellipse_max / block_v + 1.0)));
+        tiles_count += uint(max(0, max_tile_v - min_tile_v));
+
+        intersect_min_line = intersect_max_line;
+        min_line = max_line;
+    }
+
+    return tiles_count;
+}
+
+uint duplicate_to_tiles_touched(vec2 p, vec4 con_o, ivec2 grid, out uvec4 rect) {
+    rect = uvec4(0);
+
+    float disc = con_o.y * con_o.y - con_o.x * con_o.z;
+    if (con_o.x <= 0.0 || con_o.z <= 0.0 || disc >= 0.0 || con_o.w <= (1.0 / 255.0)) {
+        return 0;
+    }
+
+    float t = 2.0 * log(con_o.w * 255.0);
+
+    float x_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.x));
+    x_term = (con_o.y < 0.0) ? x_term : -x_term;
+    float y_term = sqrt(-(con_o.y * con_o.y * t) / (disc * con_o.z));
+    y_term = (con_o.y < 0.0) ? y_term : -y_term;
+
+    vec2 bbox_argmin = vec2(p.y - y_term, p.x - x_term);
+    vec2 bbox_argmax = vec2(p.y + y_term, p.x + x_term);
+
+    vec2 bbox_min = vec2(
+        compute_ellipse_intersection(con_o, disc, t, p, true, bbox_argmin.x).x,
+        compute_ellipse_intersection(con_o, disc, t, p, false, bbox_argmin.y).x
+    );
+    vec2 bbox_max = vec2(
+        compute_ellipse_intersection(con_o, disc, t, p, true, bbox_argmax.x).y,
+        compute_ellipse_intersection(con_o, disc, t, p, false, bbox_argmax.y).y
+    );
+
+    ivec2 rect_min = ivec2(
+        max(0, min(grid.x, int(bbox_min.x / float(TILE_WIDTH)))),
+        max(0, min(grid.y, int(bbox_min.y / float(TILE_HEIGHT))))
+    );
+    ivec2 rect_max = ivec2(
+        max(0, min(grid.x, int(bbox_max.x / float(TILE_WIDTH) + 1.0))),
+        max(0, min(grid.y, int(bbox_max.y / float(TILE_HEIGHT) + 1.0)))
+    );
+
+    int y_span = rect_max.y - rect_min.y;
+    int x_span = rect_max.x - rect_min.x;
+    if (y_span * x_span == 0) {
+        return 0;
+    }
+
+    rect = uvec4(uint(rect_min.x), uint(rect_min.y), uint(rect_max.x), uint(rect_max.y));
+    bool is_y = y_span < x_span;
+    return process_tiles_count(con_o, disc, t, p, bbox_min, bbox_max, bbox_argmin, bbox_argmax, rect_min, rect_max, is_y);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= vertices.length()) {
+        return;
+    }
+    if (index == 0) {
+////        debugPrintfEXT("width: %d, height: %d, tan_fovx: %f, tan_fovy: %f\n", width, height, tan_fovx, tan_fovy);
+    }
+
+    ivec2 tile_shape = ivec2((width + TILE_WIDTH - 1) / TILE_WIDTH, (height + TILE_HEIGHT - 1) / TILE_HEIGHT);
+//    assert(tile_shape.x == 50 && tile_shape.y == 38, "invalid tile shape: %d %d\n", tile_shape);
+
+    attr[index].color_radii.w = 0.0;
+    tiles_overlap[index] = 0;
+    if (mask[index] == 0u) {
+        return;
+    }
+
+    vec4 p_hom = proj_mat * vertices[index].position;
+    float p_w = 1.0f / p_hom.w;
+    vec3 ndc = vec3(p_hom.xyz * p_w);
+
+    vec4 p_view = view_mat * vertices[index].position;
+    if (p_view.z <= 0.2f) {
+        return;
+    }
+
+    mat2 cov2d = compute_cov2d(p_view.xyz);
+    float det = determinant(cov2d);
+    if (det <= 0.0) {
+        return;
+    }
+    mat2 conic = inverse(cov2d);
+    attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
+    attr[index].conic_opacity.w = vertices[index].scale_opacity.w;
+
+    vec2 uv = vec2(ndc2Pix(ndc.x, int(width)), ndc2Pix(ndc.y, int(height)));
+    float mid = 0.5 * (cov2d[0][0] + cov2d[1][1]);
+    float lambda1 = mid + sqrt(max(0.1, mid * mid - det));
+    float lambda2 = mid - sqrt(max(0.1, mid * mid - det));
+    float lambda = max(lambda1, lambda2);
+    float radii = ceil(3.0 * sqrt(lambda));
+
+    uvec4 bounding_box;
+    uint num_tiles_overlap = 0u;
+    if (use_origin_intersection != 0u) {
+        num_tiles_overlap = duplicate_to_tiles_touched_origin(uv, radii, tile_shape, bounding_box);
+    } else {
+        num_tiles_overlap = duplicate_to_tiles_touched(
+            uv,
+            attr[index].conic_opacity,
+            tile_shape,
+            bounding_box
+        );
+    }
+    if (num_tiles_overlap == 0) {
+        return;
+    }
+    assert(num_tiles_overlap <= width * height, "too many tiles overlap: %d\n", num_tiles_overlap);
+    attr[index].aabb = bounding_box;
+    tiles_overlap[index] = num_tiles_overlap;
+    attr[index].depth = p_view.z;
+    attr[index].color_radii.w = radii;
+    attr[index].color_radii.xyz = compute_sh();
+    attr[index].uv = uv;
+    attr[index].magic = MAGIC;
+//    attr[index*2].magic = MAGIC;
+}

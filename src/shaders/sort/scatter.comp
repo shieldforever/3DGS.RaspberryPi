@@ -1,0 +1,73 @@
+#version 460
+
+#define WORKGROUP_SIZE 256U
+#define RADIX_SORT_BINS 256U
+
+layout(local_size_x = 1) in;
+
+layout(push_constant, std430) uniform PushConstants {
+    uint g_num_elements;
+    uint g_shift;
+    uint g_num_workgroups;
+    uint g_num_blocks_per_workgroup;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer elements_in_low {
+    uint g_elements_in_low[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer elements_out_low {
+    uint g_elements_out_low[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer payload_in {
+    uint g_payload_in[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer payload_out {
+    uint g_payload_out[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer offsets_in {
+    uint g_offsets[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer elements_in_high {
+    uint g_elements_in_high[];
+};
+
+layout(std430, set = 0, binding = 6) writeonly buffer elements_out_high {
+    uint g_elements_out_high[];
+};
+
+uint key_bin(uint low, uint high) {
+    if (g_shift < 32U) {
+        return (low >> g_shift) & (RADIX_SORT_BINS - 1U);
+    }
+    return (high >> (g_shift - 32U)) & (RADIX_SORT_BINS - 1U);
+}
+
+void main() {
+    uint wID = gl_WorkGroupID.x;
+    uint write_pos[RADIX_SORT_BINS];
+    for (uint b = 0U; b < RADIX_SORT_BINS; ++b) {
+        write_pos[b] = g_offsets[wID * RADIX_SORT_BINS + b];
+    }
+
+    for (uint block = 0U; block < g_num_blocks_per_workgroup; ++block) {
+        uint base = wID * g_num_blocks_per_workgroup * WORKGROUP_SIZE + block * WORKGROUP_SIZE;
+        for (uint t = 0U; t < WORKGROUP_SIZE; ++t) {
+            uint eid = base + t;
+            if (eid >= g_num_elements) {
+                continue;
+            }
+            uint low = g_elements_in_low[eid];
+            uint high = g_elements_in_high[eid];
+            uint bin = key_bin(low, high);
+            uint dst = write_pos[bin]++;
+            g_elements_out_low[dst] = low;
+            g_elements_out_high[dst] = high;
+            g_payload_out[dst] = g_payload_in[eid];
+        }
+    }
+}

@@ -1,0 +1,52 @@
+#version 460
+
+#define WORKGROUP_SIZE 256
+#define RADIX_SORT_BINS 16U
+
+layout(local_size_x = WORKGROUP_SIZE) in;
+
+layout(push_constant, std430) uniform PushConstants {
+    uint g_num_elements;
+    uint g_shift;
+    uint g_num_workgroups;
+    uint g_num_blocks_per_workgroup;
+};
+
+layout(std430, set = 0, binding = 0) buffer elements_in_low {
+    uint g_elements_in_low[];
+};
+
+layout(std430, set = 0, binding = 1) buffer histograms {
+    uint g_histograms[];
+};
+
+layout(std430, set = 0, binding = 5) buffer elements_in_high {
+    uint g_elements_in_high[];
+};
+
+shared uint histogram[RADIX_SORT_BINS];
+
+void main() {
+    uint lID = gl_LocalInvocationID.x;
+    uint wID = gl_WorkGroupID.x;
+
+    if (lID < RADIX_SORT_BINS) {
+        histogram[lID] = 0U;
+    }
+    barrier();
+
+    for (uint index = 0U; index < g_num_blocks_per_workgroup; ++index) {
+        uint elementId = wID * g_num_blocks_per_workgroup * WORKGROUP_SIZE + index * WORKGROUP_SIZE + lID;
+        if (elementId < g_num_elements) {
+            uint bin = (g_shift < 32U)
+                           ? ((g_elements_in_low[elementId] >> g_shift) & (RADIX_SORT_BINS - 1U))
+                           : ((g_elements_in_high[elementId] >> (g_shift - 32U)) & (RADIX_SORT_BINS - 1U));
+            atomicAdd(histogram[bin], 1U);
+        }
+    }
+    barrier();
+
+    if (lID < RADIX_SORT_BINS) {
+        g_histograms[RADIX_SORT_BINS * wID + lID] = histogram[lID];
+    }
+}

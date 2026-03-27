@@ -1,0 +1,51 @@
+#version 460
+
+#define RADIX_SORT_BINS 256U
+
+layout(local_size_x = RADIX_SORT_BINS) in;
+
+layout(push_constant, std430) uniform PushConstants {
+    uint g_num_elements;
+    uint g_shift;
+    uint g_num_workgroups;
+    uint g_num_blocks_per_workgroup;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer histograms_in {
+    uint g_histograms[];
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer offsets_out {
+    uint g_offsets[];
+};
+
+shared uint bin_totals[RADIX_SORT_BINS];
+shared uint bin_prefix[RADIX_SORT_BINS];
+
+void main() {
+    uint bin = gl_LocalInvocationID.x;
+    uint numWG = g_num_workgroups;
+
+    uint total = 0U;
+    for (uint w = 0U; w < numWG; ++w) {
+        total += g_histograms[w * RADIX_SORT_BINS + bin];
+    }
+    bin_totals[bin] = total;
+    barrier();
+
+    if (bin == 0U) {
+        uint running = 0U;
+        for (uint b = 0U; b < RADIX_SORT_BINS; ++b) {
+            bin_prefix[b] = running;
+            running += bin_totals[b];
+        }
+    }
+    barrier();
+
+    uint local_running = 0U;
+    for (uint w = 0U; w < numWG; ++w) {
+        uint idx = w * RADIX_SORT_BINS + bin;
+        g_offsets[idx] = bin_prefix[bin] + local_running;
+        local_running += g_histograms[idx];
+    }
+}

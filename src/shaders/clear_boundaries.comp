@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+layout (std430, set = 0, binding = 0) writeonly buffer Out {
+    uint boundaries[];
+};
+
+layout(push_constant) uniform Constants {
+    uint count;
+};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index < count) {
+        boundaries[index] = 0u;
+    }
+}
+

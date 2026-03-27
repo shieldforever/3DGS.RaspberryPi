@@ -1,0 +1,372 @@
+/**
+* VkRadixSort written by Mirco Werner: https://github.com/MircoWerner/VkRadixSort
+* Based on implementation of Intel's Embree: https://github.com/embree/embree/blob/v4.0.0-ploc/kernels/rthwif/builder/gpu/sort.h
+*/
+
+/**
+* This shader is modified from the original to support 64-bit k-v pairs.
+* The license of the original code is as follows:
+
+    MIT License
+
+    Copyright (c) 2023 Mirco Werner
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+*/
+
+#version 460
+#extension GL_GOOGLE_include_directive: enable
+#extension GL_KHR_shader_subgroup_basic: enable
+#extension GL_KHR_shader_subgroup_ballot: enable
+#extension GL_KHR_shader_subgroup_shuffle: enable
+#extension GL_KHR_shader_subgroup_shuffle_relative: enable
+
+#define WORKGROUP_SIZE 256
+#define RADIX_SORT_BINS 256U
+#define FLAG_WORD_BITS 32U
+#define FLAG_WORDS (WORKGROUP_SIZE / FLAG_WORD_BITS)
+#define USE_BITFLAG_SCATTER 0
+#define USE_SUBGROUP_OFFSETS 0
+#define MAX_SUBGROUPS (WORKGROUP_SIZE / 4U)
+#define USE_PARALLEL_SCATTER 0
+
+#define BITS 32
+
+// 将 key_t 修改为 uint，通过两组 32 位排序来模拟 64 位排序
+#define key_t uint
+
+layout (local_size_x = WORKGROUP_SIZE) in;
+
+layout (push_constant, std430) uniform PushConstants {
+    uint g_num_elements;
+    uint g_shift;
+    uint g_num_workgroups;
+    uint g_num_blocks_per_workgroup;
+};
+
+layout (std430, set = 0, binding = 0) buffer elements_in {
+    key_t g_elements_in_low[];
+};
+
+layout (std430, set = 0, binding = 1) buffer elements_out {
+    key_t g_elements_out_low[];
+};
+
+// 新增：用于存储 64 位键高位的缓冲区（由于树莓派不支持 uint64_t）
+layout (std430, set = 0, binding = 5) buffer elements_in_high {
+    key_t g_elements_in_high[];
+};
+
+layout (std430, set = 0, binding = 6) buffer elements_out_high {
+    key_t g_elements_out_high[];
+};
+
+layout (std430, set = 0, binding = 2) buffer payload_in {
+    uint g_payload_in[];
+};
+
+layout (std430, set = 0, binding = 3) buffer payload_out {
+    uint g_payload_out[];
+};
+
+layout (std430, set = 0, binding = 4) buffer histograms {
+// [histogram_of_workgroup_0 | histogram_of_workgroup_1 | ... ]
+    uint g_histograms[];// |g_histograms| = RADIX_SORT_BINS * #WORKGROUPS = RADIX_SORT_BINS * g_num_workgroups
+};
+
+shared uint[RADIX_SORT_BINS] global_offsets;// global exclusive scan (prefix sum)
+shared uint[RADIX_SORT_BINS] bin_totals_scan;
+shared uint[RADIX_SORT_BINS] local_hist_before_wg;
+shared uint[MAX_SUBGROUPS] subgroup_totals;
+shared uint[MAX_SUBGROUPS] subgroup_prefix;
+shared uint[RADIX_SORT_BINS] block_counts;
+#if USE_BITFLAG_SCATTER
+shared uint bin_flags[RADIX_SORT_BINS][FLAG_WORDS];
+#endif
+
+void main() {
+    uint lID = gl_LocalInvocationID.x;
+    uint wID = gl_WorkGroupID.x;
+    uint numWG = g_num_workgroups;
+
+    // Faster global offset computation (stable and output-equivalent):
+    // 1) per-bin total count across all workgroups
+    // 2) per-bin local prefix before current workgroup
+    // 3) exclusive scan of per-bin totals in shared memory
+    {
+        uint total = 0U;
+        uint before = 0U;
+        for (uint w = 0; w < numWG; w++) {
+            uint t = g_histograms[w * RADIX_SORT_BINS + lID];
+            total += t;
+            if (w < wID) {
+                before += t;
+            }
+        }
+        bin_totals_scan[lID] = total;
+        local_hist_before_wg[lID] = before;
+    }
+    barrier();
+
+    uint exclusiveBinPrefix = 0U;
+#if USE_SUBGROUP_OFFSETS
+    uint sgSize = gl_SubgroupSize;
+    uint sgID = gl_SubgroupID;
+    uint sgLane = gl_SubgroupInvocationID;
+    uint numSubgroups = (WORKGROUP_SIZE + sgSize - 1U) / sgSize;
+
+    uint total_for_bin = bin_totals_scan[lID];
+    uint sg_scan = total_for_bin;
+    for (uint off = 1U; off < sgSize; off <<= 1U) {
+        uint v = subgroupShuffleUp(sg_scan, off);
+        if (sgLane >= off) {
+            sg_scan += v;
+        }
+    }
+    uint sg_prefix_inclusive = sg_scan - total_for_bin;
+    uint sg_total = subgroupBroadcast(sg_scan, sgSize - 1U);
+
+    if (subgroupElect()) {
+        subgroup_totals[sgID] = sg_total;
+    }
+    barrier();
+
+    if (lID == 0U) {
+        uint running = 0U;
+        for (uint i = 0U; i < numSubgroups; ++i) {
+            subgroup_prefix[i] = running;
+            running += subgroup_totals[i];
+        }
+    }
+    barrier();
+
+    exclusiveBinPrefix = subgroup_prefix[sgID] + sg_prefix_inclusive;
+#else
+    // Inclusive scan over bin_totals_scan (Hillis-Steele), then convert to exclusive.
+    for (uint offset = 1U; offset < RADIX_SORT_BINS; offset <<= 1U) {
+        uint add = 0U;
+        if (lID >= offset) {
+            add = bin_totals_scan[lID - offset];
+        }
+        barrier();
+        bin_totals_scan[lID] += add;
+        barrier();
+    }
+    exclusiveBinPrefix = (lID == 0U) ? 0U : bin_totals_scan[lID - 1U];
+#endif
+    global_offsets[lID] = exclusiveBinPrefix + local_hist_before_wg[lID];
+
+    barrier(); // 保留，确保 global_offsets[] 已就绪
+
+    // Stable scatter:
+    // - USE_BITFLAG_SCATTER=1: faster path with shared bitflags + atomics.
+    // - USE_BITFLAG_SCATTER=0: conservative path (V3D-friendly), exact serial order per workgroup block.
+    for (uint index = 0; index < g_num_blocks_per_workgroup; index++) {
+        uint base = wID * g_num_blocks_per_workgroup * WORKGROUP_SIZE + index * WORKGROUP_SIZE;
+        uint elementId = base + lID;
+
+#if USE_BITFLAG_SCATTER
+        // Parallel clear of bin flags for this block.
+        for (uint i = lID; i < RADIX_SORT_BINS * FLAG_WORDS; i += WORKGROUP_SIZE) {
+            bin_flags[i / FLAG_WORDS][i % FLAG_WORDS] = 0U;
+        }
+        barrier();
+
+        key_t element_low = 0U;
+        key_t element_high = 0U;
+        uint payload = 0U;
+        uint binID = 0U;
+        uint flagWord = lID / FLAG_WORD_BITS;
+        uint flagBit = 1U << (lID % FLAG_WORD_BITS);
+        bool valid = elementId < g_num_elements;
+
+        if (valid) {
+            element_low = g_elements_in_low[elementId];
+            element_high = g_elements_in_high[elementId];
+            payload = g_payload_in[elementId];
+            if (g_shift < 32) {
+                binID = (element_low >> g_shift) & (RADIX_SORT_BINS - 1);
+            } else {
+                binID = (element_high >> (g_shift - 32)) & (RADIX_SORT_BINS - 1);
+            }
+            atomicOr(bin_flags[binID][flagWord], flagBit);
+        }
+        barrier();
+
+        if (valid) {
+            uint prefix = 0U;
+            uint count = 0U;
+            for (uint i = 0; i < FLAG_WORDS; i++) {
+                uint bits = bin_flags[binID][i];
+                uint full = bitCount(bits);
+                count += full;
+                if (i < flagWord) {
+                    prefix += full;
+                } else if (i == flagWord) {
+                    prefix += bitCount(bits & (flagBit - 1U));
+                }
+            }
+
+            uint out_pos = global_offsets[binID] + prefix;
+            if (out_pos < g_num_elements) {
+                g_elements_out_low[out_pos] = element_low;
+                g_elements_out_high[out_pos] = element_high;
+                g_payload_out[out_pos] = payload;
+            }
+
+            // Last element in this bin for this block advances the running offset.
+            if (prefix + 1U == count) {
+                atomicAdd(global_offsets[binID], count);
+            }
+        }
+        barrier();
+#else
+    #if USE_PARALLEL_SCATTER
+        // Conservative subgroup-parallel scatter:
+        // one subgroup processes one bin at a time; lanes compute stable rank via ballot.
+        for (uint round = 0U; round * numSubgroups < RADIX_SORT_BINS; ++round) {
+            uint bin_round = round * numSubgroups + sgID;
+            if (bin_round < RADIX_SORT_BINS) {
+                uint write_pos = subgroupBroadcast(global_offsets[bin_round], 0U);
+
+                for (uint t0 = 0U; t0 < WORKGROUP_SIZE; t0 += sgSize) {
+                    uint t = t0 + sgLane;
+                    bool valid_t = (t < WORKGROUP_SIZE) && ((base + t) < g_num_elements);
+                    bool match = false;
+                    uint key_low_t = 0U;
+                    uint key_high_t = 0U;
+                    uint payload_t = 0U;
+
+                    if (valid_t) {
+                        uint eid = base + t;
+                        key_low_t = g_elements_in_low[eid];
+                        key_high_t = g_elements_in_high[eid];
+                        payload_t = g_payload_in[eid];
+
+                        uint bin_t;
+                        if (g_shift < 32U) {
+                            bin_t = (key_low_t >> g_shift) & (RADIX_SORT_BINS - 1U);
+                        } else {
+                            bin_t = (key_high_t >> (g_shift - 32U)) & (RADIX_SORT_BINS - 1U);
+                        }
+                        match = (bin_t == bin_round);
+                    }
+
+                    uvec4 mask = subgroupBallot(match);
+                    uint word = sgLane >> 5U;
+                    uint bit = sgLane & 31U;
+                    uint prior = 0U;
+                    if (word > 0U) prior += bitCount(mask.x);
+                    if (word > 1U) prior += bitCount(mask.y);
+                    if (word > 2U) prior += bitCount(mask.z);
+
+                    uint bitmask = (bit == 0U) ? 0U : ((1U << bit) - 1U);
+                    uint laneWordBits = (word == 0U) ? mask.x : ((word == 1U) ? mask.y : ((word == 2U) ? mask.z : mask.w));
+                    prior += bitCount(laneWordBits & bitmask);
+
+                    uint chunkCount = bitCount(mask.x) + bitCount(mask.y) + bitCount(mask.z) + bitCount(mask.w);
+                    if (match) {
+                        uint out_pos = write_pos + prior;
+                        g_elements_out_low[out_pos] = key_low_t;
+                        g_elements_out_high[out_pos] = key_high_t;
+                        g_payload_out[out_pos] = payload_t;
+                    }
+                    write_pos += chunkCount;
+                }
+
+                if (sgLane == 0U) {
+                    global_offsets[bin_round] = write_pos;
+                }
+            }
+        }
+        barrier();
+    #else
+        block_counts[lID] = 0U;
+        barrier();
+
+        if (elementId < g_num_elements) {
+            uint key_low_pre = g_elements_in_low[elementId];
+            uint key_high_pre = g_elements_in_high[elementId];
+            uint bin_pre;
+            if (g_shift < 32U) {
+                bin_pre = (key_low_pre >> g_shift) & (RADIX_SORT_BINS - 1U);
+            } else {
+                bin_pre = (key_high_pre >> (g_shift - 32U)) & (RADIX_SORT_BINS - 1U);
+            }
+            atomicAdd(block_counts[bin_pre], 1U);
+        }
+        barrier();
+
+        if (block_counts[lID] > 0U) {
+            uint write_pos = global_offsets[lID];
+            for (uint t = 0U; t < WORKGROUP_SIZE; t++) {
+                uint eid = base + t;
+                if (eid >= g_num_elements) {
+                    continue;
+                }
+
+                uint key_low_t = g_elements_in_low[eid];
+                uint key_high_t = g_elements_in_high[eid];
+                uint bin_t;
+                if (g_shift < 32U) {
+                    bin_t = (key_low_t >> g_shift) & (RADIX_SORT_BINS - 1U);
+                } else {
+                    bin_t = (key_high_t >> (g_shift - 32U)) & (RADIX_SORT_BINS - 1U);
+                }
+
+                if (bin_t == lID) {
+                    g_elements_out_low[write_pos] = key_low_t;
+                    g_elements_out_high[write_pos] = key_high_t;
+                    g_payload_out[write_pos] = g_payload_in[eid];
+                    write_pos++;
+                }
+            }
+            global_offsets[lID] = write_pos;
+        }
+        barrier();
+    #endif
+#endif
+    }
+}
+
+//    barrier();
+
+//    for (uint index = 0; index < g_num_blocks_per_workgroup; index++) {
+//        uint elementId = wID * g_num_blocks_per_workgroup * WORKGROUP_SIZE + index * WORKGROUP_SIZE + lID;
+//        if (elementId < g_num_elements) {
+//            key_t element_low = g_elements_in_low[elementId];
+//            key_t element_high = g_elements_in_high[elementId];
+//            uint payload = g_payload_in[elementId];
+//            
+//            uint binID;
+//            if (g_shift < 32) {
+//                binID = (element_low >> g_shift) & (RADIX_SORT_BINS - 1);
+//            } else {
+//                binID = (element_high >> (g_shift - 32)) & (RADIX_SORT_BINS - 1);
+//            }
+//
+//            // 使用 atomic 计数在当前 Workgroup 内部基准上分配位置
+//            uint local_pos = atomicAdd(global_offsets[binID], 1U);
+//            
+//            g_elements_out_low[local_pos] = element_low;
+//            g_elements_out_high[local_pos] = element_high;
+//            g_payload_out[local_pos] = payload; 
+//        }
+//    }
