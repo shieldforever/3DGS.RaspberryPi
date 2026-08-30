@@ -14,6 +14,8 @@ The project focuses on improving end-to-end throughput on Raspberry Pi by introd
 
 The main target is improving end-to-end throughput and reducing visible stalls when rendering multiple camera views.
 
+**Video Demo:** See `video_demo/demo.mp4`.
+
 ## Detailed Design
 
 **Function Support.**
